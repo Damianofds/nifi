@@ -54,6 +54,7 @@ import org.apache.avro.generic.GenericDatumWriter;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
+import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
@@ -93,6 +94,12 @@ import org.apache.nifi.util.FlowFilePackagerV1;
 import org.apache.nifi.util.FlowFilePackagerV2;
 import org.apache.nifi.util.FlowFilePackagerV3;
 
+import okhttp3.MediaType;
+import okhttp3.MultipartBody;
+import okhttp3.MultipartBody.Builder;
+import okhttp3.RequestBody;
+import okio.Buffer;
+
 @SideEffectFree
 @TriggerWhenEmpty
 @InputRequirement(Requirement.INPUT_REQUIRED)
@@ -119,7 +126,16 @@ import org.apache.nifi.util.FlowFilePackagerV3;
         + "FlowFile."),
     @ReadsAttribute(attribute = "tar.permissions", description = "Applicable only if the <Merge Format> property is set to TAR. The value of this "
         + "attribute must be 3 characters; each character must be in the range 0 to 7 (inclusive) and indicates the file permissions that should "
-        + "be used for the FlowFile's TAR entry. If this attribute is missing or has an invalid value, the default value of 644 will be used") })
+        + "be used for the FlowFile's TAR entry. If this attribute is missing or has an invalid value, the default value of 644 will be used"), 
+    @ReadsAttribute(attribute = "multipart.part.name", description = "Applicable only if the <Merge Format> property is set to MULTIPART. The value "
+        + "of this attribute is used to set the part name, represented by the content of this FlowFile, in the multipart body."
+        + "If this attribute is missing or has an invalid value, the merge process will fail." ), 
+    @ReadsAttribute(attribute = "filename", description = "Applicable only if the <Merge Format> property is set to MULTIPART. The value "
+        + "of this attribute is used to set the filename of the part represented by this FlowFile in the multipart body"
+        + "If this attribute is missing or has an invalid value, the merge process will fail." ),
+    @ReadsAttribute(attribute = "mime.type", description = "Applicable only if the <Merge Format> property is set to MULTIPART. The value "
+        + "of this attribute is used to set the Content-Type of the part represented by this FlowFile in the multipart body" 
+        + "If this attribute is missing or has an invalid value, the merge process will fail." ) })
 @WritesAttributes({
     @WritesAttribute(attribute = "filename", description = "When more than 1 file is merged, the filename comes from the segment.original.filename "
         + "attribute. If that attribute does not exist in the source FlowFiles, then the filename is set to the number of nanoseconds matching "
@@ -129,7 +145,10 @@ import org.apache.nifi.util.FlowFilePackagerV3;
         + "if Merge Format is FlowFileStream, then the filename will be appended with .pkg"),
     @WritesAttribute(attribute = "merge.count", description = "The number of FlowFiles that were merged into this bundle"),
     @WritesAttribute(attribute = "merge.bin.age", description = "The age of the bin, in milliseconds, when it was merged and output. Effectively "
-        + "this is the greatest amount of time that any FlowFile in this bundle remained waiting in this processor before it was output") })
+        + "this is the greatest amount of time that any FlowFile in this bundle remained waiting in this processor before it was output"),
+    @WritesAttribute(attribute = "multipart.part.separator", description = "Applicable only if the <Merge Format> property is set to MULTIPART. The value" 
+        + "of this attribute is used to comunicate to the upstream processor the separator used inside the multipart body message." 
+        + "If this attribute is missing or has an wrong value, the upstream processor will have to inspect the message and identify and extract it.")})
 @SeeAlso({SegmentContent.class, MergeRecord.class})
 public class MergeContent extends BinFiles {
 
@@ -197,6 +216,7 @@ public class MergeContent extends BinFiles {
     public static final String MERGE_FORMAT_FLOWFILE_TAR_V1_VALUE = "FlowFile Tar, v1";
     public static final String MERGE_FORMAT_CONCAT_VALUE = "Binary Concatenation";
     public static final String MERGE_FORMAT_AVRO_VALUE = "Avro";
+    public static final String MERGE_FORMAT_MULTIPART_VALUE = "Multipart";
 
     public static final AllowableValue MERGE_FORMAT_TAR = new AllowableValue(
             MERGE_FORMAT_TAR_VALUE,
@@ -231,11 +251,17 @@ public class MergeContent extends BinFiles {
             MERGE_FORMAT_AVRO_VALUE,
             MERGE_FORMAT_AVRO_VALUE,
             "The Avro contents of all FlowFiles will be concatenated together into a single FlowFile");
+    public static final AllowableValue MERGE_FORMAT_MULTIPART = new AllowableValue(
+            MERGE_FORMAT_MULTIPART_VALUE,
+            MERGE_FORMAT_MULTIPART_VALUE,
+            "A bin of FlowFiles will be combined into a MIME Multipart message body and written into a single FlowFile. ");
 
 
     public static final String TAR_PERMISSIONS_ATTRIBUTE = "tar.permissions";
     public static final String MERGE_COUNT_ATTRIBUTE = "merge.count";
     public static final String MERGE_BIN_AGE_ATTRIBUTE = "merge.bin.age";
+    public static final String MULTIPART_PART_NAME_ATTRIBUTE = "multipart.part.name";
+    public static final String MULTIPART_PART_SEPARATOR_ATTRIBUTE = "multipart.separator.name";
 
     public static final PropertyDescriptor MERGE_STRATEGY = new PropertyDescriptor.Builder()
             .name("Merge Strategy")
@@ -250,7 +276,7 @@ public class MergeContent extends BinFiles {
             .required(true)
             .name("Merge Format")
             .description("Determines the format that will be used to merge the content.")
-            .allowableValues(MERGE_FORMAT_TAR, MERGE_FORMAT_ZIP, MERGE_FORMAT_FLOWFILE_STREAM_V3, MERGE_FORMAT_FLOWFILE_STREAM_V2, MERGE_FORMAT_FLOWFILE_TAR_V1, MERGE_FORMAT_CONCAT, MERGE_FORMAT_AVRO)
+            .allowableValues(MERGE_FORMAT_TAR, MERGE_FORMAT_ZIP, MERGE_FORMAT_FLOWFILE_STREAM_V3, MERGE_FORMAT_FLOWFILE_STREAM_V2, MERGE_FORMAT_FLOWFILE_TAR_V1, MERGE_FORMAT_CONCAT, MERGE_FORMAT_AVRO, MERGE_FORMAT_MULTIPART)
             .defaultValue(MERGE_FORMAT_CONCAT.getValue())
             .build();
 
@@ -458,6 +484,9 @@ public class MergeContent extends BinFiles {
             case MERGE_FORMAT_AVRO_VALUE:
                 merger = new AvroMerge();
                 break;
+            case MERGE_FORMAT_MULTIPART_VALUE:
+                merger = new MultipartMerge();
+                break;
             default:
                 throw new AssertionError();
         }
@@ -481,6 +510,17 @@ public class MergeContent extends BinFiles {
             }
 
             Collections.sort(contents, new FragmentComparator());
+        }
+
+        if (MERGE_FORMAT_MULTIPART_VALUE.equals(mergeFormat)) {
+            final String error = getMultipartValidationError(bin.getContents());
+
+            if (error != null) {
+                getLogger().error("{}; routing {} FlowFiles to failure", new Object[]{error, bin.getContents().size()});
+                bin.getSession().transfer(contents, REL_FAILURE);
+                bin.getSession().commit();
+                return true;
+            }
         }
 
         FlowFile bundle = merger.merge(bin, context);
@@ -555,6 +595,29 @@ public class MergeContent extends BinFiles {
                 + binContents.size() + " fragments for this identifier";
         }
 
+        return null;
+    }
+
+    private String getMultipartValidationError(final List<FlowFile> binContents) {
+        if (binContents.isEmpty()) {
+            return "No FlowFiles are found to be merged in a Multipart body";
+        }
+
+        for (final FlowFile flowFile : binContents) {
+            String filename = flowFile.getAttribute(CoreAttributes.FILENAME.key());
+            String name = flowFile.getAttribute(MULTIPART_PART_NAME_ATTRIBUTE);
+            String mediaType = flowFile.getAttribute(CoreAttributes.MIME_TYPE.key());
+
+            if (StringUtils.isBlank(filename)) {
+                return "FlowFile id: '" + flowFile.getId() + "', its attribute '" + CoreAttributes.FILENAME.key() + "' is not valid, its value is: '" + filename + "'";
+            }
+            if (StringUtils.isBlank(name)) {
+                return "FlowFile id: '" + flowFile.getId() + "', its attribute '" + MULTIPART_PART_NAME_ATTRIBUTE + "' is not valid, its value is: '" + name + "'";
+            }
+            if (StringUtils.isBlank(mediaType)) {
+                return "FlowFile id: '" + flowFile.getId() + "', its attribute '" + CoreAttributes.MIME_TYPE.key() + "' is not valid, its value is: '" + mediaType + "'";
+            }
+        }
         return null;
     }
 
@@ -1058,7 +1121,70 @@ public class MergeContent extends BinFiles {
         }
     }
 
+    private class MultipartMerge implements MergeBin{
 
+        private List<FlowFile> unmerged = new ArrayList<>();
+        
+        @Override
+        public FlowFile merge(Bin bin, ProcessContext context) {
+            
+            final List<FlowFile> contents = bin.getContents();
+
+            final ProcessSession session = bin.getSession();
+            FlowFile bundle = session.create(bin.getContents());
+            final String multipartSeparator = "---NiFi---" + Math.random()*10000 + "---";
+            try {
+                bundle = session.write(bundle, new OutputStreamCallback() {
+                    @Override
+                    public void process(final OutputStream out) throws IOException {
+                        Builder bodyBuilder = new MultipartBody.Builder(multipartSeparator);
+                        final Iterator<FlowFile> itr = contents.iterator();
+                        while (itr.hasNext()) {
+                            final FlowFile flowFile = itr.next();
+                            String filename = flowFile.getAttribute(CoreAttributes.FILENAME.key());
+                            String name = flowFile.getAttribute(MULTIPART_PART_NAME_ATTRIBUTE);
+                            String mediaType = flowFile.getAttribute(CoreAttributes.MIME_TYPE.key());
+                            bin.getSession().read(flowFile, false, new InputStreamCallback() {
+                                @Override
+                                public void process(final InputStream in) throws IOException {
+                                    RequestBody rb = RequestBody.create(MediaType.parse(mediaType), IOUtils.toByteArray(in)); //TODO how to write directly on the final outputstream???
+                                    bodyBuilder.addFormDataPart(name, filename, rb);
+                                }
+                            });
+                        }
+                        MultipartBody mbody = bodyBuilder.build();
+                        try(Buffer b = new Buffer()){
+                            mbody.writeTo(b);
+                            StreamUtils.copy(b.inputStream(), out);
+                        }
+                        
+                    }
+                });
+            } catch (final Exception e) {
+                session.remove(bundle);
+                throw e;
+            }
+
+            session.getProvenanceReporter().join(contents, bundle);
+            bundle = session.putAttribute(bundle, MULTIPART_PART_SEPARATOR_ATTRIBUTE, multipartSeparator);
+            bundle = session.putAttribute(bundle, CoreAttributes.FILENAME.key(), createFilename(contents));
+
+            return bundle;
+        }
+
+        @Override
+        public String getMergedContentType() {
+            //TODO supporting initially only mixed but should support at least even digest to be RFC compliant
+            // see https://en.wikipedia.org/wiki/MIME#Multipart_messages
+            // [...] The RFC initially defined 4 subtypes: mixed, digest, alternative and parallel. A minimally compliant application must support mixed and digest; other subtypes are optional.[...]
+            return "multipart/mixed";
+        }
+
+        @Override
+        public List<FlowFile> getUnmergedFlowFiles() {
+            return unmerged;
+        }
+    }
 
     private static class FragmentComparator implements Comparator<FlowFile> {
 

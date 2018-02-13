@@ -60,6 +60,14 @@ import org.junit.BeforeClass;
 import org.junit.Ignore;
 import org.junit.Test;
 
+import ch.qos.logback.classic.Logger;
+import okhttp3.MediaType;
+import okhttp3.MultipartBody;
+import okhttp3.MultipartBody.Builder;
+import okhttp3.MultipartBody.Part;
+import okhttp3.RequestBody;
+import okio.Buffer;
+
 public class TestMergeContent {
 
     @BeforeClass
@@ -804,6 +812,122 @@ public class TestMergeContent {
         bundle.assertAttributeEquals(CoreAttributes.MIME_TYPE.key(), "application/tar");
     }
 
+    @Test
+    public void testMultipartBody() throws IOException {
+        final TestRunner runner = TestRunners.newTestRunner(new MergeContent());
+        runner.setProperty(MergeContent.MAX_BIN_AGE, "1 sec");
+        runner.setProperty(MergeContent.MERGE_FORMAT, MergeContent.MERGE_FORMAT_MULTIPART);
+
+        final Map<String, String> attributes = new HashMap<>();
+
+        attributes.put(CoreAttributes.FILENAME.key(), "part1.txt");
+        attributes.put(CoreAttributes.MIME_TYPE.key(), javax.ws.rs.core.MediaType.TEXT_PLAIN);
+        attributes.put(MergeContent.MULTIPART_PART_NAME_ATTRIBUTE, "part1");
+        runner.enqueue("Hello".getBytes("UTF-8"), attributes);
+
+        attributes.put(CoreAttributes.FILENAME.key(), "part2.txt");
+        attributes.put(CoreAttributes.MIME_TYPE.key(), javax.ws.rs.core.MediaType.TEXT_PLAIN);
+        attributes.put(MergeContent.MULTIPART_PART_NAME_ATTRIBUTE, "part2");
+        runner.enqueue(", ".getBytes("UTF-8"), attributes);
+
+        attributes.put(CoreAttributes.FILENAME.key(), "part3.pdf");
+        attributes.put(CoreAttributes.MIME_TYPE.key(), javax.ws.rs.core.MediaType.APPLICATION_OCTET_STREAM);
+        attributes.put(MergeContent.MULTIPART_PART_NAME_ATTRIBUTE, "part3");
+        runner.enqueue("World!".getBytes("UTF-8"), attributes);
+        runner.run();
+
+        runner.assertQueueEmpty();
+
+        final MockFlowFile bundle = runner.getFlowFilesForRelationship(MergeContent.REL_MERGED).get(0);
+        bundle.assertAttributeEquals(CoreAttributes.MIME_TYPE.key(), "multipart/mixed");
+        bundle.assertAttributeExists(MergeContent.MULTIPART_PART_SEPARATOR_ATTRIBUTE);
+        String separator = bundle.getAttribute(MergeContent.MULTIPART_PART_SEPARATOR_ATTRIBUTE);
+        Assert.assertTrue(separator.startsWith("---NiFi---"));
+        Assert.assertTrue(separator.endsWith("---"));
+    }
+
+    @Test
+    public void testMultipartBodyMissingFilenameAttribute() throws IOException {
+        String[][] config = { { "", "mimetype2", "partname2" }, { null, "mimetype2", "partname2" } };
+        for (int i = 0; i <= 1; i++) {
+            MockFlowFile mff = testMultipartBodyMissingAttributes(null, config[i]);
+        }
+    }
+
+    @Test
+    public void testMultipartBodyMissingMultipartPartNameAttribute() throws IOException {
+        String[][] config = { { "filename3", "mimetype3", "" }, { "filename", "mimetype", null },
+                { "filename3", "mimetype3", "partname3" } };
+        for (int i = 0; i <= 2; i++) {
+            String attributeToTest = (i == 2) ? MergeContent.MULTIPART_PART_NAME_ATTRIBUTE : null;
+            MockFlowFile mff = testMultipartBodyMissingAttributes(attributeToTest, config[i]);
+        }
+    }
+
+    @Test
+    public void testMultipartBodyMissingContentTypeAttribute() throws IOException {
+        String[][] config = { { "filename1", "", "partname1" }, { "filename2", null, "partname2" },
+                { "filename3", "mimetype3", "partname3" } };
+        for (int i = 0; i <= 2; i++) {
+            String attributeToTest = (i == 2) ? CoreAttributes.MIME_TYPE.key() : null;
+            MockFlowFile mff = testMultipartBodyMissingAttributes(attributeToTest, config[i]);
+        }
+    }
+
+    private MockFlowFile testMultipartBodyMissingAttributes(String attributeToTest, String[] flowFile1Attributes)
+            throws IOException {
+        final TestRunner runner = TestRunners.newTestRunner(new MergeContent());
+        runner.setProperty(MergeContent.MAX_BIN_AGE, "1 sec");
+        runner.setProperty(MergeContent.MERGE_FORMAT, MergeContent.MERGE_FORMAT_MULTIPART);
+
+        final Map<String, String> attributes = new HashMap<>();
+
+        attributes.put(CoreAttributes.FILENAME.key(), flowFile1Attributes[0]);
+        attributes.put(CoreAttributes.MIME_TYPE.key(), flowFile1Attributes[1]);
+        attributes.put(MergeContent.MULTIPART_PART_NAME_ATTRIBUTE, flowFile1Attributes[2]);
+        if (attributeToTest != null) {
+            attributes.remove(attributeToTest);
+        }
+
+        runner.enqueue("Hello".getBytes("UTF-8"), attributes);
+        runner.run();
+        runner.assertQueueEmpty();
+        Assert.assertTrue(runner.getFlowFilesForRelationship(MergeContent.REL_MERGED).isEmpty());
+        MockFlowFile mff = runner.getFlowFilesForRelationship(MergeContent.REL_FAILURE).get(0);
+        return mff;
+    }
+    
+    @Test
+    public void testMultipartBodyCreation() throws IOException {
+        
+        final String BOUNDARY = "123456";
+        
+        MediaType textPlain = MediaType.parse(javax.ws.rs.core.MediaType.TEXT_PLAIN);
+        MediaType octetStream = MediaType.parse(javax.ws.rs.core.MediaType.APPLICATION_OCTET_STREAM);
+        
+        RequestBody part1 = RequestBody.create(textPlain, "I'm the body of a part");
+        RequestBody part2 = RequestBody.create(textPlain, "I'm the body of another part");
+        RequestBody part3 = RequestBody.create(octetStream, new File("/home/fds/work/data/Frankstahl_pdf_testdata/processed/1!0mzwoe.pdf"));
+        
+        String part1FileName = "part1";
+        String part2FileName = "part2";
+        String part3FileName = "part3";
+        
+        String part1Name = "filenamePart1";
+        String part2Name = "filenamePart2";
+        String part3Name = "filenamePart3";
+        
+        Builder bodyBuilder = new MultipartBody.Builder(BOUNDARY);
+        bodyBuilder.addFormDataPart(part1Name, part1FileName, part1);
+        bodyBuilder.addFormDataPart(part2Name, part2FileName, part2);
+        bodyBuilder.addFormDataPart(part3Name, part3FileName, part3);
+        MultipartBody mbody = bodyBuilder.build();
+        
+        Buffer b = new Buffer();
+        mbody.writeTo(b);
+        b.readUtf8();
+    }
+    
     @Test
     public void testFlowFileStream() throws IOException {
         final TestRunner runner = TestRunners.newTestRunner(new MergeContent());
